@@ -3,8 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import psycopg2
-import psycopg2.extras
-import json
+import psycopg2.pool
 from datetime import datetime
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -17,12 +16,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ── Base de données ─────────────────────────────────────────────────────────────
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+# ── Pool de connexions ─────────────────────────────────────────────────────────
+pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=20,
+    dsn=DATABASE_URL,
+    sslmode="require"
+)
 
+def get_conn():
+    return pool.getconn()
+
+def release_conn(conn):
+    pool.putconn(conn)
+
+# ── Init base de données ───────────────────────────────────────────────────────
 def init_db():
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
@@ -51,6 +62,8 @@ def init_db():
                 )
             """)
         conn.commit()
+    finally:
+        release_conn(conn)
 
 def calc_points(g1p, g2p, g1r, g2r) -> int:
     if g1p == g1r and g2p == g2r:
@@ -88,7 +101,8 @@ async def on_ready():
 @app_commands.checks.has_permissions(administrator=True)
 async def ajout_match(inter: discord.Interaction, match_id: str, equipe1: str, equipe2: str, date: str):
     match_id = match_id.upper()
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO matches (match_id, equipe1, equipe2, date, closed)
@@ -96,6 +110,8 @@ async def ajout_match(inter: discord.Interaction, match_id: str, equipe1: str, e
                 ON CONFLICT (match_id) DO UPDATE SET equipe1=EXCLUDED.equipe1, equipe2=EXCLUDED.equipe2, date=EXCLUDED.date
             """, (match_id, equipe1, equipe2, date))
         conn.commit()
+    finally:
+        release_conn(conn)
     embed = discord.Embed(
         title="⚽ Nouveau match ajouté",
         color=0x00b300,
@@ -110,11 +126,14 @@ async def ajout_match(inter: discord.Interaction, match_id: str, equipe1: str, e
 @app_commands.checks.has_permissions(administrator=True)
 async def fermer_pronos(inter: discord.Interaction, match_id: str):
     match_id = match_id.upper()
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("UPDATE matches SET closed=TRUE WHERE match_id=%s RETURNING equipe1, equipe2", (match_id,))
             row = cur.fetchone()
         conn.commit()
+    finally:
+        release_conn(conn)
     if not row:
         await inter.response.send_message("❌ Match introuvable.", ephemeral=True)
         return
@@ -126,7 +145,8 @@ async def fermer_pronos(inter: discord.Interaction, match_id: str):
 @app_commands.checks.has_permissions(administrator=True)
 async def resultat(inter: discord.Interaction, match_id: str, buts1: int, buts2: int):
     match_id = match_id.upper()
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT equipe1, equipe2 FROM matches WHERE match_id=%s", (match_id,))
             row = cur.fetchone()
@@ -147,6 +167,8 @@ async def resultat(inter: discord.Interaction, match_id: str, buts1: int, buts2:
                     """, (user_id, pts))
                     awarded.append((user_id, pts))
         conn.commit()
+    finally:
+        release_conn(conn)
 
     embed = discord.Embed(
         title=f"🏁 Résultat : {equipe1} {buts1} - {buts2} {equipe2}",
@@ -164,10 +186,13 @@ async def resultat(inter: discord.Interaction, match_id: str, buts1: int, buts2:
 
 @bot.tree.command(name="matchs", description="Affiche tous les matchs disponibles")
 async def matchs(inter: discord.Interaction):
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT match_id, equipe1, equipe2, date, closed, goals1, goals2 FROM matches ORDER BY date")
             rows = cur.fetchall()
+    finally:
+        release_conn(conn)
     if not rows:
         await inter.response.send_message("Aucun match programmé pour l'instant.", ephemeral=True)
         return
@@ -187,7 +212,8 @@ async def matchs(inter: discord.Interaction):
 @app_commands.describe(match_id="ID du match (voir /matchs)", buts1="Buts équipe 1", buts2="Buts équipe 2")
 async def prono(inter: discord.Interaction, match_id: str, buts1: int, buts2: int):
     match_id = match_id.upper()
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT equipe1, equipe2, closed FROM matches WHERE match_id=%s", (match_id,))
             row = cur.fetchone()
@@ -204,6 +230,8 @@ async def prono(inter: discord.Interaction, match_id: str, buts1: int, buts2: in
                 ON CONFLICT (user_id, match_id) DO UPDATE SET goals1=EXCLUDED.goals1, goals2=EXCLUDED.goals2
             """, (user_id, match_id, buts1, buts2))
         conn.commit()
+    finally:
+        release_conn(conn)
     embed = discord.Embed(
         title="✅ Pronostic enregistré !",
         color=0x2ecc71,
@@ -216,7 +244,8 @@ async def prono(inter: discord.Interaction, match_id: str, buts1: int, buts2: in
 @bot.tree.command(name="mes_pronos", description="Affiche tous tes pronostics")
 async def mes_pronos(inter: discord.Interaction):
     user_id = str(inter.user.id)
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT p.match_id, m.equipe1, m.equipe2, p.goals1, p.goals2, m.goals1, m.goals2
@@ -226,6 +255,8 @@ async def mes_pronos(inter: discord.Interaction):
             rows = cur.fetchall()
             cur.execute("SELECT total FROM scores WHERE user_id=%s", (user_id,))
             score_row = cur.fetchone()
+    finally:
+        release_conn(conn)
     if not rows:
         await inter.response.send_message("Tu n'as encore aucun pronostic enregistré.", ephemeral=True)
         return
@@ -247,10 +278,13 @@ async def mes_pronos(inter: discord.Interaction):
 
 @bot.tree.command(name="classement", description="Affiche le classement général")
 async def classement(inter: discord.Interaction):
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id, total FROM scores ORDER BY total DESC LIMIT 20")
             rows = cur.fetchall()
+    finally:
+        release_conn(conn)
     if not rows:
         await inter.response.send_message("Aucun point attribué pour l'instant.", ephemeral=True)
         return
@@ -298,7 +332,8 @@ async def regles(inter: discord.Interaction):
 @bot.tree.command(name="stats", description="[Admin] Affiche les statistiques générales du concours")
 @app_commands.checks.has_permissions(administrator=True)
 async def stats(inter: discord.Interaction):
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(DISTINCT user_id) FROM pronostics")
             nb_participants = cur.fetchone()[0]
@@ -314,6 +349,8 @@ async def stats(inter: discord.Interaction):
             best = cur.fetchone()
             cur.execute("SELECT AVG(total) FROM scores")
             moyenne = cur.fetchone()[0]
+    finally:
+        release_conn(conn)
 
     embed = discord.Embed(
         title="📊 Statistiques — Coupe du Monde 2026",
@@ -340,22 +377,22 @@ async def stats_error(inter: discord.Interaction, error):
         await inter.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
 
 
-@bot.tree.command(name="egalites", description="[Admin] Affiche les joueurs à égalité de points pour un tirage au sort")
+@bot.tree.command(name="egalites", description="[Admin] Affiche les joueurs à égalité pour un tirage au sort")
 @app_commands.checks.has_permissions(administrator=True)
 async def egalites(inter: discord.Interaction):
-    with get_conn() as conn:
+    conn = get_conn()
+    try:
         with conn.cursor() as cur:
-            # Trouver le score maximum
             cur.execute("SELECT MAX(total) FROM scores")
             row = cur.fetchone()
             if not row or row[0] is None:
                 await inter.response.send_message("Aucun point attribué pour l'instant.", ephemeral=True)
                 return
             max_score = row[0]
-
-            # Trouver tous les joueurs avec ce score maximum
             cur.execute("SELECT user_id, total FROM scores WHERE total = %s ORDER BY user_id", (max_score,))
             joueurs = cur.fetchall()
+    finally:
+        release_conn(conn)
 
     if len(joueurs) == 1:
         embed = discord.Embed(
