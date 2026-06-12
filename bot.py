@@ -340,6 +340,48 @@ async def stats_error(inter: discord.Interaction, error):
         await inter.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
 
 
+@bot.tree.command(name="egalites", description="[Admin] Affiche les joueurs à égalité de points pour un tirage au sort")
+@app_commands.checks.has_permissions(administrator=True)
+async def egalites(inter: discord.Interaction):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Trouver le score maximum
+            cur.execute("SELECT MAX(total) FROM scores")
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                await inter.response.send_message("Aucun point attribué pour l'instant.", ephemeral=True)
+                return
+            max_score = row[0]
+
+            # Trouver tous les joueurs avec ce score maximum
+            cur.execute("SELECT user_id, total FROM scores WHERE total = %s ORDER BY user_id", (max_score,))
+            joueurs = cur.fetchall()
+
+    if len(joueurs) == 1:
+        embed = discord.Embed(
+            title="🏆 Pas d'égalité !",
+            color=0x2ecc71,
+            description=f"<@{joueurs[0][0]}> est seul en tête avec **{max_score} pts** !\nPas besoin de tirage au sort 🎉"
+        )
+    else:
+        embed = discord.Embed(
+            title=f"⚖️ Égalité — {len(joueurs)} joueurs à {max_score} pts !",
+            color=0xe74c3c,
+            description="Les joueurs suivants sont à égalité et doivent départager :"
+        )
+        lines = "\n".join(f"🎲 <@{uid}>" for uid, _ in joueurs)
+        embed.add_field(name="Participants au tirage au sort", value=lines, inline=False)
+        embed.set_footer(text=f"{len(joueurs)} joueurs ex-aequo à {max_score} points")
+
+    await inter.response.send_message(embed=embed, ephemeral=True)
+
+
+@egalites.error
+async def egalites_error(inter: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await inter.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+
+
 # ── Lancement ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot.run(TOKEN)
